@@ -1,0 +1,11 @@
+# Install on Colab AFTER selecting a GPU runtime. JAX must match the runtime's
+# CUDA version -- on Colab the easiest path is the line in the notebook's setup
+# cell (pip install -U "jax[cuda12]"). These are the framework-level deps.
+craftax>=1.4.0
+flax>=0.8.0
+optax>=0.2.0
+distrax>=0.1.5
+numpy>=1.24
+matplotlib>=3.7
+scikit-learn>=1.3   # optional: cross-checks for NMI
+imageio>=2.31       # rollout GIFs (Phase 6)

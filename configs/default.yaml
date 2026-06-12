@@ -1,0 +1,71 @@
+# Default hyperparameters per phase. The notebook reads these into the
+# *Config NamedTuples; override any field inline for quick sweeps.
+
+# ---- Phase 1: PPO baseline ----
+ppo:
+  total_timesteps: 5_000_000
+  num_envs: 1024
+  num_steps: 64
+  num_minibatches: 8
+  update_epochs: 4
+  gamma: 0.99
+  gae_lambda: 0.8
+  clip_eps: 0.2
+  ent_coef: 0.01
+  vf_coef: 0.5
+  lr: 3.0e-4
+  seed: 0
+
+# ---- Phase 1: data collection ----
+collect:
+  total_frames: 500_000      # bump to 1-5M if Drive space allows
+  num_envs: 256
+  ppo_epsilon: 0.2           # random-action mix for state coverage
+
+# ---- Phase 2: latent action model ----
+lam:
+  codebook_size: 32          # K ~ 16-32 (Craftax-classic has 17 actions)
+  code_dim: 64
+  commitment_cost: 0.25
+  lr: 3.0e-4
+  batch_size: 256
+  steps: 20_000
+
+# ---- Phase 3: RSSM world model ----
+rssm:
+  deter_dim: 512
+  stoch_categories: 32
+  stoch_classes: 32
+  hidden: 512
+  free_bits: 1.0
+  kl_scale: 1.0
+  kl_balance: 0.8
+  lr: 3.0e-4
+  seq_len: 32
+  batch_size: 32
+  steps: 20_000
+
+# ---- Phase 4: action decoder ----
+decoder:
+  hidden: 128
+  lr: 1.0e-3
+  epochs: 50
+  batch_size: 256
+  label_fractions: [0.01, 0.05, 0.25, 1.0]
+
+# ---- Phase 4: imagination agent ----
+agent:
+  imag_horizon: 15
+  gamma: 0.997
+  lambda_: 0.95
+  actor_lr: 4.0e-5
+  critic_lr: 1.0e-4
+  entropy_coef: 3.0e-3
+  steps: 5_000
+  batch_size: 256
+  context: 8
+
+# ---- Phase 5: ablations ----
+ablations:
+  codebook_sizes: [8, 16, 32, 64]
+  pretrain_data_fractions: [0.25, 0.5, 1.0]

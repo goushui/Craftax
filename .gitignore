@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.DS_Store
+checkpoints/
+data/trajectories/*.npz
+results/
+*.ipynb_checkpoints
