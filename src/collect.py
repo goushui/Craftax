@@ -13,6 +13,7 @@ smaller -- bump ``total_frames`` if you have the Drive space).
 from __future__ import annotations
 
 import os
+import functools
 from typing import Callable, Optional
 
 import numpy as np
@@ -20,6 +21,25 @@ import jax
 import jax.numpy as jnp
 
 from .env_utils import make_craftax, get_dims, reset_vec, step_vec
+
+
+def _step_once(state, policy, env, env_params, is_pixels):
+    """One env step producing a host-friendly transition dict (used by the
+    chunked collector's scan body). Frames are quantized to uint8 on-device for
+    pixel mode so the host copy is 4x smaller."""
+    p_rng = jax.random.fold_in(state.rng, 1)
+    actions = policy(state.obs, p_rng)
+    new_state, tr = step_vec(env, env_params, state, actions)
+    frame = tr["obs"]
+    if is_pixels:
+        frame = jnp.clip(jnp.round(frame * 255.0), 0, 255).astype(jnp.uint8)
+    out = {
+        "frame": frame,
+        "action": tr["action"].astype(jnp.int16),
+        "reward": tr["reward"].astype(jnp.float32),
+        "done": tr["done"],
+    }
+    return new_state, out
 
 
 def _random_policy(num_actions):
@@ -48,57 +68,67 @@ def collect_dataset(
     obs_mode: str = "pixels",
     seed: int = 0,
     save_path: Optional[str] = None,
+    chunk_steps: int = 64,
 ):
     """Collect ``total_frames`` transitions under ``policy``.
 
     ``policy(obs, rng) -> actions`` maps a batch of observations to a batch of
     discrete actions. Returns a dict of numpy arrays and optionally saves it.
+
+    The rollout is done in chunks of ``chunk_steps`` env-steps: each chunk is
+    converted to uint8 and copied to host RAM before the next chunk runs, so GPU
+    memory only ever holds one chunk's worth of frames (not the whole dataset).
+    This is what keeps pixel collection from OOM-ing on a single GPU -- a full
+    300k-frame float32 buffer is ~13 GB, but one chunk is a few hundred MB.
     """
     env, env_params = make_craftax(obs_mode=obs_mode, auto_reset=True)
     _, num_actions = get_dims(env, env_params)
 
-    steps = total_frames // num_envs
+    total_steps = total_frames // num_envs
+    chunk_steps = min(chunk_steps, total_steps)
+    num_chunks = (total_steps + chunk_steps - 1) // chunk_steps
     rng = jax.random.PRNGKey(seed)
     state = reset_vec(env, env_params, rng, num_envs)
 
-    @jax.jit
-    def rollout(state):
-        def body(state, _):
-            p_rng = jax.random.fold_in(state.rng, 1)
-            actions = policy(state.obs, p_rng)
-            new_state, tr = step_vec(env, env_params, state, actions)
-            out = {
-                "frame": tr["obs"],            # (N, H, W, 3) float in [0,1]
-                "action": tr["action"],
-                "reward": tr["reward"],
-                "done": tr["done"],
-            }
-            return new_state, out
-        return jax.lax.scan(body, state, None, length=steps)
+    is_pixels = obs_mode == "pixels"
 
-    state, traj = rollout(state)
-    jax.block_until_ready(traj["frame"])
+    @functools.partial(jax.jit, static_argnums=(1,))
+    def rollout_chunk(state, length):
+        return jax.lax.scan(
+            lambda s, _: _step_once(s, policy, env, env_params, is_pixels),
+            state, None, length=length)
 
-    # (steps, N, ...) -> (steps*N, ...). Frames -> uint8 to save space.
-    def flatten(x):
-        x = np.asarray(x)
-        return x.reshape((-1,) + x.shape[2:])
+    frames_chunks, action_chunks, reward_chunks, done_chunks = [], [], [], []
+    remaining = total_steps
+    for c in range(num_chunks):
+        length = min(chunk_steps, remaining)
+        state, traj = rollout_chunk(state, length)
+        # pull this chunk to host RAM, freeing GPU memory before the next chunk
+        frames_chunks.append(np.asarray(traj["frame"]))
+        action_chunks.append(np.asarray(traj["action"]))
+        reward_chunks.append(np.asarray(traj["reward"]))
+        done_chunks.append(np.asarray(traj["done"]))
+        remaining -= length
+        print(f"[collect] chunk {c + 1}/{num_chunks}  "
+              f"({(total_steps - remaining) * num_envs:,}/{total_frames:,} frames)")
 
-    frames = flatten(traj["frame"])
-    if frames.max() <= 1.0 + 1e-3:
-        frames = (frames * 255.0).clip(0, 255).astype(np.uint8)
-    else:
-        frames = frames.clip(0, 255).astype(np.uint8)
+    def stack_flat(chunks):
+        x = np.concatenate(chunks, axis=0)          # (steps, N, ...)
+        return x.reshape((-1,) + x.shape[2:])       # (steps*N, ...)
+
+    frames = stack_flat(frames_chunks)
+    if not is_pixels:  # symbolic obs stay float; leave as-is
+        frames = frames.astype(np.float32)
 
     data = {
-        "frames": frames,                       # (T, H, W, 3) uint8
-        "actions": flatten(traj["action"]).astype(np.int16),
-        "rewards": flatten(traj["reward"]).astype(np.float32),
-        "dones": flatten(traj["done"]).astype(bool),
+        "frames": frames,
+        "actions": stack_flat(action_chunks).astype(np.int16),
+        "rewards": stack_flat(reward_chunks).astype(np.float32),
+        "dones": stack_flat(done_chunks).astype(bool),
         "num_actions": np.int64(num_actions),
     }
 
-    print(f"[collect] frames={data['frames'].shape} "
+    print(f"[collect] frames={data['frames'].shape} dtype={data['frames'].dtype} "
           f"actions in [{data['actions'].min()}, {data['actions'].max()}] "
           f"size~={data['frames'].nbytes / 1e9:.2f}GB")
 
