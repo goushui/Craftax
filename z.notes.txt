@@ -1,0 +1,5 @@
+https://colab.research.google.com/github/goushui/Craftax/blob/main/notebooks/craftax_latent_action.ipynb
+
+
+
+ 

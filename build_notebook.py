@@ -77,11 +77,11 @@ print("src package loaded.")
 """)
 
 code(r"""
-# Storage for checkpoints/data/results. Default: a LOCAL dir inside the runtime
-# (no Drive popup). Everything here is reproducible from the seeded cells, so
-# losing it on disconnect just means re-running. If you start a long run you
-# don't want to lose, set USE_DRIVE = True to persist to Google Drive instead.
-USE_DRIVE = False
+# Storage for checkpoints/data/results. Default: Google DRIVE, so everything
+# persists across runtime disconnects/timeouts. The first run pops an auth
+# dialog; after that it's automatic. Set USE_DRIVE = False to use a local
+# runtime dir instead (no popup, but wiped on disconnect).
+USE_DRIVE = True
 if USE_DRIVE:
     from src.checkpoint import mount_drive
     BASE = mount_drive("craftax-latent-action")
@@ -93,6 +93,18 @@ else:
 CKPT = os.path.join(BASE, "checkpoints")
 DATA = os.path.join(BASE, "data/trajectories")
 RESULTS = os.path.join(BASE, "results")
+print("checkpoints ->", CKPT)
+print("datasets    ->", DATA)
+print("results     ->", RESULTS)
+
+
+def savefig(name):
+    # Save the current matplotlib figure into RESULTS/ as a PNG, then show it.
+    import matplotlib.pyplot as plt
+    path = os.path.join(RESULTS, name)
+    plt.savefig(path, dpi=130, bbox_inches="tight")
+    print("[fig] saved ->", path)
+    plt.show()
 """)
 
 # ---------------------------------------------------------------------------
@@ -117,7 +129,7 @@ code(r"""
 from src.visualize import rollout_frames, show_grid
 frames, actions, rewards = rollout_frames(num_steps=120, seed=3)
 print("total reward:", rewards.sum())
-show_grid(frames[::4], cols=8, titles=actions[::4]); import matplotlib.pyplot as plt; plt.show()
+show_grid(frames[::4], cols=8, titles=actions[::4]); import matplotlib.pyplot as plt; savefig("rollout_grid.png")
 """)
 
 # ---------------------------------------------------------------------------
@@ -149,7 +161,7 @@ import numpy as np
 plt.figure(figsize=(7,4))
 plt.plot(np.asarray(ppo_metrics["reward"]))
 plt.xlabel("update"); plt.ylabel("mean step reward"); plt.title("PPO baseline training")
-plt.grid(alpha=0.3); plt.show()
+plt.grid(alpha=0.3); savefig("ppo_training_curve.png")
 
 from src.checkpoint import save_state
 save_state(ppo_state, os.path.join(CKPT, "ppo_baseline.msgpack"))
@@ -215,7 +227,7 @@ true_actions = pairs["a_t"]
 from src.eval import report_latent_quality
 NUM_ACTIONS = int(merged["num_actions"])
 q = report_latent_quality(codes, true_actions, lam_cfg.codebook_size, NUM_ACTIONS, plot=True)
-import matplotlib.pyplot as plt; plt.show()
+import matplotlib.pyplot as plt; savefig("phase2_confusion_matrix.png")
 """)
 
 code(r"""
@@ -223,7 +235,7 @@ code(r"""
 # decoder's predicted o_t+1 (with its discrete code z). Blurry-but-directional
 # predictions are normal; look for the predicted frame moving in the right way.
 from src.visualize import show_lam_predictions
-show_lam_predictions(lam_model, lam_state, pairs, n=6); plt.show()
+show_lam_predictions(lam_model, lam_state, pairs, n=6); savefig("phase2_lam_predictions.png")
 """)
 
 # ---------------------------------------------------------------------------
@@ -291,7 +303,7 @@ mse_T = rollout_error(rssm_model_T, rssm_state_T, sym["frames"], sym["actions"],
 
 from src.eval import plot_rollout_comparison
 import matplotlib.pyplot as plt
-plot_rollout_comparison(mse_L, mse_T); plt.show()
+plot_rollout_comparison(mse_L, mse_T); savefig("phase3_rollout_comparison.png")
 """)
 
 code(r"""
@@ -301,7 +313,7 @@ code(r"""
 from src.visualize import imagination_vs_real_rewards
 imagination_vs_real_rewards(rssm_model_L, rssm_state_L, rssm_cfg_latent,
                             sym["frames"], code_stream, sym["rewards"],
-                            sym["dones"], horizon=20); plt.show()
+                            sym["dones"], horizon=20); savefig("phase3_imagination_vs_real.png")
 """)
 
 # ---------------------------------------------------------------------------
@@ -323,7 +335,7 @@ rows, majority = label_budget_sweep(codes, true_actions, NUM_ACTIONS,
 
 from src.eval import plot_label_budget
 import matplotlib.pyplot as plt
-plot_label_budget(rows, majority); plt.show()
+plot_label_budget(rows, majority); savefig("phase4_label_budget.png")
 
 # Fit a final decoder on 100% labels to get the code->action lookup for eval.
 import numpy as np
@@ -373,10 +385,10 @@ scores = {
     "PPO (proxy reward)": ppo_final,
     "Latent-pretrained agent": score_latent,
 }
-plot_score_comparison(scores); plt.show()
+plot_score_comparison(scores); savefig("phase5_score_comparison.png")
 
 xs, ys = ppo_score_curve(ppo_metrics, ppo_cfg.num_envs, ppo_cfg.num_steps)
-plot_sample_efficiency({"PPO": (xs, ys)}); plt.show()
+plot_sample_efficiency({"PPO": (xs, ys)}); savefig("phase5_sample_efficiency.png")
 """)
 
 code(r"""
