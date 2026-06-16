@@ -36,46 +36,65 @@ from flax.training.train_state import TrainState
 # ---------------------------------------------------------------------------
 
 class VectorQuantizer(nn.Module):
-    """Discrete VQ bottleneck with straight-through gradients."""
-    codebook_size: int          # K
-    code_dim: int               # D
+    """Discrete VQ bottleneck with straight-through gradients.
+
+    Snaps each continuous input vector to its nearest entry in a learned
+    codebook of K vectors, returning both the discrete index and the snapped
+    vector. The straight-through estimator lets gradients skip the
+    non-differentiable argmin so the encoder still trains.
+
+    Shapes (B = batch; K = codebook_size; D = code_dim):
+        input  inputs   : (B, D)        continuous embedding from the encoder
+        codebook (param): (K, D)        the K learnable code vectors
+        dist            : (B, K)        squared L2 distance to every code
+        codes           : (B,)          argmin index -> the discrete latent z
+        quantized       : (B, D)        codebook[codes], the snapped vector
+    """
+    codebook_size: int          # K: number of discrete codes (e.g. 32)
+    code_dim: int               # D: dimensionality of each code vector (e.g. 64)
     commitment_cost: float = 0.25
 
     @nn.compact
     def __call__(self, inputs):
-        # inputs: (B, D)
+        # codebook: (K, D) learnable matrix, one row per discrete code.
         codebook = self.param(
             "codebook",
             nn.initializers.variance_scaling(1.0, "fan_in", "uniform"),
             (self.codebook_size, self.code_dim),
         )
-        # squared L2 distance to each code
+        # Squared L2 distance from each input to each code, via |a-b|^2 =
+        # |a|^2 - 2 a.b + |b|^2.  Shapes broadcast to (B, K):
+        #   |inputs|^2 : (B, 1)   ;  inputs @ codebook.T : (B, K)  ;  |code|^2 : (1, K)
         dist = (
-            jnp.sum(inputs ** 2, axis=1, keepdims=True)
-            - 2 * inputs @ codebook.T
-            + jnp.sum(codebook ** 2, axis=1)[None, :]
-        )
-        codes = jnp.argmin(dist, axis=1)                  # (B,)
-        quantized = codebook[codes]                       # (B, D)
+            jnp.sum(inputs ** 2, axis=1, keepdims=True)        # (B, 1)
+            - 2 * inputs @ codebook.T                          # (B, K)
+            + jnp.sum(codebook ** 2, axis=1)[None, :]          # (1, K)
+        )                                                       # -> (B, K)
+        codes = jnp.argmin(dist, axis=1)                  # (B,)  the discrete z_t
+        quantized = codebook[codes]                       # (B, D)  gathered code vectors
 
-        # losses
+        # VQ losses (van den Oord 2017): pull codebook toward encoder outputs
+        # (codebook_loss) and pull encoder outputs toward codes (commitment_loss).
         codebook_loss = jnp.mean((jax.lax.stop_gradient(inputs) - quantized) ** 2)
         commitment_loss = jnp.mean((inputs - jax.lax.stop_gradient(quantized)) ** 2)
         vq_loss = codebook_loss + self.commitment_cost * commitment_loss
 
-        # straight-through: gradient flows to inputs unchanged
-        quantized_st = inputs + jax.lax.stop_gradient(quantized - inputs)
+        # Straight-through estimator: forward value is `quantized`, but the
+        # gradient is routed to `inputs` unchanged (the +stop_gradient(diff)
+        # trick makes the two equal in value, identity in gradient).
+        quantized_st = inputs + jax.lax.stop_gradient(quantized - inputs)  # (B, D)
 
-        # codebook usage perplexity (diagnostic for collapse)
-        onehot = jax.nn.one_hot(codes, self.codebook_size)
-        probs = jnp.mean(onehot, axis=0)
-        perplexity = jnp.exp(-jnp.sum(probs * jnp.log(probs + 1e-10)))
+        # Perplexity = effective number of codes in use this batch. Near K means
+        # healthy usage; near 1 means codebook collapse (a common VQ failure).
+        onehot = jax.nn.one_hot(codes, self.codebook_size)   # (B, K)
+        probs = jnp.mean(onehot, axis=0)                     # (K,) usage histogram
+        perplexity = jnp.exp(-jnp.sum(probs * jnp.log(probs + 1e-10)))  # scalar
 
         return {
-            "quantized": quantized_st,
-            "codes": codes,
-            "vq_loss": vq_loss,
-            "perplexity": perplexity,
+            "quantized": quantized_st,   # (B, D) snapped vector w/ ST gradient
+            "codes": codes,              # (B,)   discrete latent action z_t
+            "vq_loss": vq_loss,          # scalar
+            "perplexity": perplexity,    # scalar diagnostic
         }
 
 
@@ -84,52 +103,95 @@ class VectorQuantizer(nn.Module):
 # ---------------------------------------------------------------------------
 
 class CNNEncoder(nn.Module):
-    """Encode a stacked frame pair (H, W, 6) into a flat embedding."""
-    features: tuple = (32, 64, 128, 256)
-    embed_dim: int = 256
+    """Encode a stacked frame pair (H, W, 6) into a flat embedding.
+
+    Four stride-2 conv blocks halve the spatial resolution each time while
+    growing the channel count, then a Dense projects the flattened grid to a
+    fixed-width embedding.
+
+    Shapes (B = batch; input is the channel-concatenated frame pair, so 6
+    channels = two RGB frames; Craftax pixel obs is 63x63):
+
+        input  x          : (B, 63, 63, 6)
+        Conv(32,  s2)     : (B, 32, 32, 32)    # ceil(63/2)=32
+        Conv(64,  s2)     : (B, 16, 16, 64)
+        Conv(128, s2)     : (B,  8,  8, 128)
+        Conv(256, s2)     : (B,  4,  4, 256)
+        reshape           : (B, 4*4*256) = (B, 4096)
+        Dense(embed_dim)  : (B, 256)
+    """
+    features: tuple = (32, 64, 128, 256)   # output channels per conv block
+    embed_dim: int = 256                   # width of the final flat embedding
 
     @nn.compact
     def __call__(self, x):
+        # x starts at (B, 63, 63, 6); each block halves H,W and sets channels=f.
         for f in self.features:
-            x = nn.Conv(f, (4, 4), strides=(2, 2), padding="SAME")(x)
-            x = nn.LayerNorm()(x)
+            x = nn.Conv(f, (4, 4), strides=(2, 2), padding="SAME")(x)  # (B, H/2, W/2, f)
+            x = nn.LayerNorm()(x)                                       # normalize over last dim
             x = nn.gelu(x)
-        x = x.reshape((x.shape[0], -1))
-        x = nn.Dense(self.embed_dim)(x)
+        x = x.reshape((x.shape[0], -1))      # (B, 4, 4, 256) -> (B, 4096)
+        x = nn.Dense(self.embed_dim)(x)      # (B, 4096) -> (B, 256)
         return x
 
 
 class CNNDecoder(nn.Module):
     """Predict o_{t+1} given o_t (H,W,3) and latent action z (D,).
 
-    Conditioning is by FiLM-style modulation injected at the bottleneck plus
-    concatenation of o_t so the decoder mostly copies and edits the frame.
+    The decoder encodes o_t down to a small spatial grid, modulates that grid
+    with the latent action z via FiLM (feature-wise affine), then upsamples back
+    to a full frame. Conditioning on o_t means the network only has to predict
+    the *change* the action caused, not redraw the whole scene.
+
+    Shapes (B = batch; out_shape = (63, 63, 3); D = code_dim = 64):
+
+        input  o_t            : (B, 63, 63, 3)
+        input  z              : (B, 64)
+        -- downsample o_t --
+        Conv(32,  s2)         : (B, 32, 32, 32)
+        Conv(64,  s2)         : (B, 16, 16, 64)
+        Conv(128, s2)         : (B,  8,  8, 128)
+        Conv(256, s2)         : (B,  4,  4, 256)
+        -- FiLM modulation from z --
+        Dense(256) -> gamma   : (B, 256) -> broadcast (B, 1, 1, 256)
+        Dense(256) -> beta    : (B, 256) -> broadcast (B, 1, 1, 256)
+        x = x*(1+gamma)+beta  : (B, 4, 4, 256)
+        -- upsample (ConvTranspose doubles H,W each block) --
+        ConvT(256, s2)        : (B,  8,  8, 256)
+        ConvT(128, s2)        : (B, 16, 16, 128)
+        ConvT(64,  s2)        : (B, 32, 32, 64)
+        ConvT(32,  s2)        : (B, 64, 64, 32)
+        Conv(3)               : (B, 64, 64, 3)
+        resize -> out_shape   : (B, 63, 63, 3)   (sigmoid -> pixels in [0,1])
     """
-    out_shape: tuple             # (H, W, 3)
-    features: tuple = (256, 128, 64, 32)
+    out_shape: tuple             # (H, W, C) of the predicted frame, e.g. (63,63,3)
+    features: tuple = (256, 128, 64, 32)   # upsampling channels per block
 
     @nn.compact
     def __call__(self, o_t, z):
         H, W, C = self.out_shape
-        # encode o_t to a small spatial grid
-        x = o_t
+        # ----- downsample o_t to a (B, 4, 4, 256) latent grid -----
+        x = o_t                               # (B, 63, 63, 3)
         for f in (32, 64, 128, 256):
-            x = nn.Conv(f, (4, 4), strides=(2, 2), padding="SAME")(x)
+            x = nn.Conv(f, (4, 4), strides=(2, 2), padding="SAME")(x)  # halves H,W
             x = nn.LayerNorm()(x)
             x = nn.gelu(x)
-        # x: (B, h, w, 256); inject z via FiLM
-        gamma = nn.Dense(x.shape[-1])(z)[:, None, None, :]
-        beta = nn.Dense(x.shape[-1])(z)[:, None, None, :]
-        x = x * (1 + gamma) + beta
+        # ----- FiLM: scale+shift the grid by an affine fn of the latent z -----
+        # gamma/beta: Dense maps z (B, D) -> (B, 256), reshaped to (B,1,1,256)
+        # so they broadcast across the 4x4 spatial grid.
+        gamma = nn.Dense(x.shape[-1])(z)[:, None, None, :]   # (B, 1, 1, 256)
+        beta = nn.Dense(x.shape[-1])(z)[:, None, None, :]    # (B, 1, 1, 256)
+        x = x * (1 + gamma) + beta                           # (B, 4, 4, 256)
 
+        # ----- upsample back to full resolution -----
         for f in self.features:
-            x = nn.ConvTranspose(f, (4, 4), strides=(2, 2), padding="SAME")(x)
+            x = nn.ConvTranspose(f, (4, 4), strides=(2, 2), padding="SAME")(x)  # doubles H,W
             x = nn.LayerNorm()(x)
             x = nn.gelu(x)
-        x = nn.Conv(C, (3, 3), padding="SAME")(x)
-        # crop/resize to exact out shape
-        x = jax.image.resize(x, (x.shape[0], H, W, C), method="bilinear")
-        return nn.sigmoid(x)
+        x = nn.Conv(C, (3, 3), padding="SAME")(x)            # (B, 64, 64, 3)
+        # ConvTranspose lands on 64x64; resize to the exact obs shape (63x63).
+        x = jax.image.resize(x, (x.shape[0], H, W, C), method="bilinear")  # (B, 63, 63, 3)
+        return nn.sigmoid(x)                                 # pixels in [0,1]
 
 
 # ---------------------------------------------------------------------------
@@ -137,29 +199,44 @@ class CNNDecoder(nn.Module):
 # ---------------------------------------------------------------------------
 
 class LatentActionModel(nn.Module):
-    out_shape: tuple             # (H, W, 3)
-    codebook_size: int = 32
-    code_dim: int = 64
+    """Full inverse+forward dynamics model (the Phase-2 novel piece).
+
+    Data flow (B = batch; frames are 63x63x3; D = code_dim; K = codebook_size):
+
+        o_t, o_tp1                  : each (B, 63, 63, 3)
+        concat on channels -> pair  : (B, 63, 63, 6)
+        CNNEncoder(pair)            : (B, 256)          inverse-dynamics embedding
+        Dense(D)                    : (B, 64)
+        VectorQuantizer             : code z_t (B,) + quantized (B, 64)
+        CNNDecoder(o_t, quantized)  : (B, 63, 63, 3)    forward prediction of o_tp1
+    """
+    out_shape: tuple             # (H, W, C) of a single frame, e.g. (63,63,3)
+    codebook_size: int = 32      # K: number of discrete latent actions
+    code_dim: int = 64           # D: width of the pre-quantization embedding
     commitment_cost: float = 0.25
 
     @nn.compact
     def __call__(self, o_t, o_tp1):
-        pair = jnp.concatenate([o_t, o_tp1], axis=-1)     # (B,H,W,6)
-        h = CNNEncoder()(pair)
-        h = nn.Dense(self.code_dim)(h)
+        pair = jnp.concatenate([o_t, o_tp1], axis=-1)     # (B, 63, 63, 6)
+        h = CNNEncoder()(pair)                            # (B, 256)
+        h = nn.Dense(self.code_dim)(h)                    # (B, 64) project to code dim
         vq = VectorQuantizer(self.codebook_size, self.code_dim,
-                             self.commitment_cost)(h)
-        recon = CNNDecoder(self.out_shape)(o_t, vq["quantized"])
+                             self.commitment_cost)(h)      # codes (B,), quantized (B, 64)
+        recon = CNNDecoder(self.out_shape)(o_t, vq["quantized"])  # (B, 63, 63, 3)
         return {"recon": recon, **vq}
 
     def encode(self, o_t, o_tp1):
-        """Return only the discrete code z_t (for downstream phases)."""
-        pair = jnp.concatenate([o_t, o_tp1], axis=-1)
-        h = CNNEncoder()(pair)
-        h = nn.Dense(self.code_dim)(h)
+        """Return only the discrete code z_t (B,) for downstream phases.
+
+        Same encoder+VQ path as __call__ but skips the decoder, so it's cheap to
+        run over the whole dataset when extracting latent actions.
+        """
+        pair = jnp.concatenate([o_t, o_tp1], axis=-1)     # (B, 63, 63, 6)
+        h = CNNEncoder()(pair)                            # (B, 256)
+        h = nn.Dense(self.code_dim)(h)                    # (B, 64)
         vq = VectorQuantizer(self.codebook_size, self.code_dim,
                              self.commitment_cost)(h)
-        return vq["codes"]
+        return vq["codes"]                                # (B,) discrete latent actions
 
 
 # ---------------------------------------------------------------------------

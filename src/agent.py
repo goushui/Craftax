@@ -37,17 +37,37 @@ from .rssm import RSSM, RSSMConfig, make_sequence_sampler
 
 
 class ActorCritic(nn.Module):
-    num_inputs: int          # action vocabulary the RSSM consumes (codebook K)
-    hidden: int = 512
+    """Actor-critic that reads RSSM features and emits latent-action logits.
+
+    Unlike the PPO baseline (which reads raw observations), this reads the
+    pretrained world model's latent feature ``feat = [h, stoch]`` and outputs a
+    distribution over the RSSM's *input vocabulary* (the latent codes), not the
+    real actions -- so imagination stays inside the learned dynamics.
+
+    Shapes (B = batch; F = feat_dim = deter_dim + stoch_dim = 1536;
+    H = hidden = 512; A = num_inputs = codebook K):
+
+        input  feat       : (B, 1536)
+        actor:  Dense(H)  : (B, 1536) -> (B, 512)
+                Dense(H)  : (B, 512)  -> (B, 512)
+                Dense(A)  : (B, 512)  -> (B, A)    logits over latent codes
+        critic: Dense(H)  : (B, 1536) -> (B, 512)
+                Dense(H)  : (B, 512)  -> (B, 512)
+                Dense(1)  : (B, 512)  -> (B, 1) -> squeeze -> (B,)   value
+    """
+    num_inputs: int          # A: action vocabulary the RSSM consumes (codebook K)
+    hidden: int = 512        # H: hidden width
 
     @nn.compact
     def __call__(self, feat):
-        a = nn.gelu(nn.Dense(self.hidden)(feat))
-        a = nn.gelu(nn.Dense(self.hidden)(a))
-        logits = nn.Dense(self.num_inputs)(a)
-        v = nn.gelu(nn.Dense(self.hidden)(feat))
-        v = nn.gelu(nn.Dense(self.hidden)(v))
-        value = jnp.squeeze(nn.Dense(1)(v), -1)
+        # ----- actor: feat -> logits over latent codes -----
+        a = nn.gelu(nn.Dense(self.hidden)(feat))   # (B, 1536) -> (B, 512)
+        a = nn.gelu(nn.Dense(self.hidden)(a))      # (B, 512)  -> (B, 512)
+        logits = nn.Dense(self.num_inputs)(a)      # (B, 512)  -> (B, A)
+        # ----- critic: feat -> scalar value -----
+        v = nn.gelu(nn.Dense(self.hidden)(feat))   # (B, 1536) -> (B, 512)
+        v = nn.gelu(nn.Dense(self.hidden)(v))      # (B, 512)  -> (B, 512)
+        value = jnp.squeeze(nn.Dense(1)(v), -1)    # (B, 1)    -> (B,)
         return distrax.Categorical(logits=logits), value
 
 

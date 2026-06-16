@@ -83,51 +83,82 @@ class RSSMConfig(NamedTuple):
 
 
 class RSSM(nn.Module):
+    """Recurrent State-Space Model.
+
+    The latent state has two parts (Dreamer factorization):
+      * h     -- deterministic GRU hidden state, size ``deter_dim`` (512)
+      * stoch -- stochastic state, ``stoch_categories`` x ``stoch_classes``
+                 one-hot variables flattened to ``stoch_dim`` = 32*32 = 1024.
+    The decoders read the concatenated feature ``[h, stoch]`` of size
+    ``deter_dim + stoch_dim`` = 1536.
+
+    Dimension glossary used in the layer comments below (defaults in parens):
+      A   = num_inputs   action vocabulary (codebook K or num_actions)
+      Hd  = hidden       MLP width (512)
+      De  = deter_dim    GRU state size (512)
+      S   = stoch_dim    flattened stochastic size (1024 = 32*32)
+      O   = obs_dim      symbolic observation size (~8268)
+    """
     cfg: RSSMConfig
 
     def setup(self):
         c = self.cfg
-        self.act_embed = nn.Dense(c.hidden)
-        self.gru_in = nn.Dense(c.hidden)
-        self.gru = nn.GRUCell(features=c.deter_dim)
-        self.prior_mlp = nn.Dense(c.hidden)
-        self.prior_logits = nn.Dense(c.stoch_dim)
-        self.obs_in = nn.Dense(c.hidden)
-        self.post_mlp = nn.Dense(c.hidden)
-        self.post_logits = nn.Dense(c.stoch_dim)
-        # decoders
-        self.obs_dec = nn.Sequential([nn.Dense(c.hidden), nn.gelu,
-                                      nn.Dense(c.hidden), nn.gelu,
-                                      nn.Dense(c.obs_dim)])
-        self.rew_dec = nn.Sequential([nn.Dense(c.hidden), nn.gelu,
-                                      nn.Dense(1)])
-        self.cont_dec = nn.Sequential([nn.Dense(c.hidden), nn.gelu,
-                                       nn.Dense(1)])
+        # Layer  (in -> out):
+        self.act_embed = nn.Dense(c.hidden)      # A      -> Hd   embed the action
+        self.gru_in = nn.Dense(c.hidden)         # S+Hd   -> Hd   pre-GRU mixing
+        self.gru = nn.GRUCell(features=c.deter_dim)  # (De, Hd) -> De  recurrent core
+        self.prior_mlp = nn.Dense(c.hidden)      # De     -> Hd
+        self.prior_logits = nn.Dense(c.stoch_dim)  # Hd   -> S    prior over next stoch
+        self.obs_in = nn.Dense(c.hidden)         # O      -> Hd   embed the observation
+        self.post_mlp = nn.Dense(c.hidden)       # De+Hd  -> Hd
+        self.post_logits = nn.Dense(c.stoch_dim)  # Hd    -> S    posterior over stoch
+        # Decoder heads read feat = [h, stoch] of size De+S = 1536.
+        self.obs_dec = nn.Sequential([nn.Dense(c.hidden), nn.gelu,   # 1536 -> Hd
+                                      nn.Dense(c.hidden), nn.gelu,    # Hd   -> Hd
+                                      nn.Dense(c.obs_dim)])           # Hd   -> O  (reconstruct obs)
+        self.rew_dec = nn.Sequential([nn.Dense(c.hidden), nn.gelu,   # 1536 -> Hd
+                                      nn.Dense(1)])                   # Hd   -> 1  (reward)
+        self.cont_dec = nn.Sequential([nn.Dense(c.hidden), nn.gelu,  # 1536 -> Hd
+                                       nn.Dense(1)])                  # Hd   -> 1  (continue prob)
 
     # -- one step of the recurrent prior -------------------------------------
     def _img_step(self, h, stoch, action_onehot, rng):
+        """Advance the deterministic state and sample the *prior* stoch (the
+        model's guess of the next stochastic state without seeing the obs).
+
+        Shapes (B = batch):
+            h             : (B, De=512)
+            stoch         : (B, S=1024)
+            action_onehot : (B, A)
+        """
         c = self.cfg
-        a = self.act_embed(action_onehot)
-        x = jnp.concatenate([stoch, a], axis=-1)
-        x = nn.gelu(self.gru_in(x))
-        h, _ = self.gru(h, x)             # flax GRUCell: (carry, out)
-        # prior over next stoch from h
-        p = nn.gelu(self.prior_mlp(h))
-        prior_logits = self.prior_logits(p).reshape(
-            (-1, c.stoch_categories, c.stoch_classes))
+        a = self.act_embed(action_onehot)         # (B, A)    -> (B, Hd=512)
+        x = jnp.concatenate([stoch, a], axis=-1)  # (B, S+Hd = 1536)
+        x = nn.gelu(self.gru_in(x))               # (B, 1536) -> (B, Hd=512)
+        h, _ = self.gru(h, x)                     # GRUCell((B,De),(B,Hd)) -> (B, De)
+        # prior over next stochastic state, as logits reshaped to per-variable
+        p = nn.gelu(self.prior_mlp(h))            # (B, De)   -> (B, Hd)
+        prior_logits = self.prior_logits(p).reshape(  # (B, Hd) -> (B, S) ->
+            (-1, c.stoch_categories, c.stoch_classes))  # (B, 32, 32)
         rng, srng = jax.random.split(rng)
-        prior_stoch = onehot_st(prior_logits, srng).reshape((-1, c.stoch_dim))
+        prior_stoch = onehot_st(prior_logits, srng).reshape((-1, c.stoch_dim))  # (B, S)
         return h, prior_stoch, prior_logits
 
     def _obs_step(self, h, obs, rng):
+        """Sample the *posterior* stoch from h and the actual observation.
+
+        Shapes:
+            h   : (B, De=512)
+            obs : (B, O~=8268)
+        """
         c = self.cfg
-        e = nn.gelu(self.obs_in(symlog(obs)))
-        x = jnp.concatenate([h, e], axis=-1)
-        x = nn.gelu(self.post_mlp(x))
-        post_logits = self.post_logits(x).reshape(
-            (-1, c.stoch_categories, c.stoch_classes))
+        e = nn.gelu(self.obs_in(symlog(obs)))     # (B, O)    -> (B, Hd=512)
+        x = jnp.concatenate([h, e], axis=-1)      # (B, De+Hd = 1024)
+        x = nn.gelu(self.post_mlp(x))             # (B, 1024) -> (B, Hd=512)
+        post_logits = self.post_logits(x).reshape(  # (B, Hd) -> (B, S) ->
+            (-1, c.stoch_categories, c.stoch_classes))  # (B, 32, 32)
         rng, srng = jax.random.split(rng)
-        post_stoch = onehot_st(post_logits, srng).reshape((-1, c.stoch_dim))
+        post_stoch = onehot_st(post_logits, srng).reshape((-1, c.stoch_dim))  # (B, S)
         return post_stoch, post_logits
 
     def initial(self, batch):

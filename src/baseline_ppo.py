@@ -29,21 +29,44 @@ from .env_utils import make_craftax, get_dims, achievements_from_info
 # ---------------------------------------------------------------------------
 
 class ActorCritic(nn.Module):
-    num_actions: int
-    hidden: int = 512
+    """Shared-input actor-critic MLP.
+
+    Two separate 2-layer MLP towers (actor + critic) both read the raw
+    observation. The actor head outputs one logit per action; the critic head
+    outputs a single scalar value.
+
+    Layer shapes (B = batch = num_envs, e.g. 1024; obs_dim ~= 8268 for
+    Craftax-classic symbolic; H = hidden = 512; A = num_actions = 17):
+
+        input  x        : (B, obs_dim)
+        actor:
+          Dense(H)      : (B, obs_dim) @ (obs_dim, H) + (H,)   -> (B, H)
+          Dense(H)      : (B, H)       @ (H, H)       + (H,)   -> (B, H)
+          Dense(A)      : (B, H)       @ (H, A)       + (A,)   -> (B, A)   logits
+        critic:
+          Dense(H)      : (B, obs_dim) -> (B, H)
+          Dense(H)      : (B, H)       -> (B, H)
+          Dense(1)      : (B, H)       -> (B, 1) -> squeeze -> (B,)        value
+    """
+    num_actions: int          # A: size of the discrete action space (17)
+    hidden: int = 512         # H: width of each hidden layer
 
     @nn.compact
     def __call__(self, x):
-        act = nn.relu(nn.Dense(self.hidden)(x))
-        act = nn.relu(nn.Dense(self.hidden)(act))
+        # ----- actor tower: obs -> action logits -----
+        act = nn.relu(nn.Dense(self.hidden)(x))     # (B, obs_dim) -> (B, H)
+        act = nn.relu(nn.Dense(self.hidden)(act))   # (B, H)       -> (B, H)
+        # final layer initialized small (orthogonal gain 0.01) so the initial
+        # policy is near-uniform -- a standard PPO stability trick.
         logits = nn.Dense(self.num_actions,
-                          kernel_init=nn.initializers.orthogonal(0.01))(act)
-        pi = distrax.Categorical(logits=logits)
+                          kernel_init=nn.initializers.orthogonal(0.01))(act)  # (B, A)
+        pi = distrax.Categorical(logits=logits)     # categorical over A actions
 
-        val = nn.relu(nn.Dense(self.hidden)(x))
-        val = nn.relu(nn.Dense(self.hidden)(val))
-        value = nn.Dense(1)(val)
-        return pi, jnp.squeeze(value, -1)
+        # ----- critic tower: obs -> scalar state value -----
+        val = nn.relu(nn.Dense(self.hidden)(x))     # (B, obs_dim) -> (B, H)
+        val = nn.relu(nn.Dense(self.hidden)(val))   # (B, H)       -> (B, H)
+        value = nn.Dense(1)(val)                    # (B, H)       -> (B, 1)
+        return pi, jnp.squeeze(value, -1)           # value: (B, 1) -> (B,)
 
 
 class Transition(NamedTuple):

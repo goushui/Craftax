@@ -24,14 +24,25 @@ from flax.training.train_state import TrainState
 
 
 class ActionDecoder(nn.Module):
-    num_actions: int
-    codebook_size: int
-    hidden: int = 128
+    """Tiny MLP mapping a one-hot latent code to real-action logits.
+
+    Input is the latent action z as a one-hot vector over the codebook, output
+    is one logit per real Craftax action.
+
+    Shapes (B = batch; K = codebook_size; H = hidden = 128; A = num_actions = 17):
+
+        input  z_onehot   : (B, K)
+        Dense(H) + relu   : (B, K) -> (B, 128)
+        Dense(A)          : (B, 128) -> (B, A)   logits over real actions
+    """
+    num_actions: int          # A: real Craftax action count (17)
+    codebook_size: int        # K: latent codebook size (input width)
+    hidden: int = 128         # H
 
     @nn.compact
     def __call__(self, z_onehot):
-        x = nn.relu(nn.Dense(self.hidden)(z_onehot))
-        return nn.Dense(self.num_actions)(x)
+        x = nn.relu(nn.Dense(self.hidden)(z_onehot))  # (B, K) -> (B, 128)
+        return nn.Dense(self.num_actions)(x)          # (B, 128) -> (B, A)
 
 
 class DecoderConfig(NamedTuple):
